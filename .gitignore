@@ -1,0 +1,9 @@
+#Compiled Binaries
+server
+client
+
+# Object files
+*.o
+
+# Build artifacts
+*.out

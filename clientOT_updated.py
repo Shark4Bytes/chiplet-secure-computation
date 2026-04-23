@@ -111,7 +111,7 @@ def receive_evaluator_wire_labels_ot(
     if not send_message(conn, "HELLO", session_id, "receiver"):
         raise ConnectionError("Failed to send HELLO")
 
-    buffer = b""
+    buffer = b""  # Buffer for accumulating incoming data until we get a full line
 
     def recv_line() -> str:
         nonlocal buffer

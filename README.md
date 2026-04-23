@@ -1,15 +1,11 @@
 Quick test for bidirectional TCP comms between two boards (or VMs).
 
-Build:
-  make
+Connect to the PYNQ Z2 boards
 
-Run:
-- Terminal A (server):
-  ./server <ip address> <port>
+From there 
+python3 serverOT_updated.py <ip addr> <port>
 
-- Terminal B (client, connect to server IP):
-  ./client <ip address> <port>
+Then
+python3 clientOT_updated.py <server_ip> <port> <wirechoices>
 
-Usage:
-- Type `hello` (or any text) on either side and press Enter.
-- The remote side will print: received: {hello}
+Currently coded for just 2 wire labels.  Uses independent tokens for each wire label.  However, will be expanded once we combine OT and Garbled Circuit.  

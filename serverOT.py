@@ -1,31 +1,71 @@
-# server.py - dummy Oblivious Transfer sender over TCP
+#!/usr/bin/env python3
+# serverOT.py - staged OT-style sender over TCP
 #
 # Protocol:
 #   Client -> HELLO|<session_id>|receiver
 #   Server -> HELLO_ACK|<session_id>|sender
-#   Client -> OT_CHOICE|<session_id>|0_or_1
-#   Server -> OT_RESULT|<session_id>|<selected_message>
+#   Client -> OT_INIT|<session_id>|<receiver_token>
+#   Server -> OT_MASKS|<session_id>|<sender_nonce>|<mask0>|<mask1>|<enc0>|<enc1>
+#   Client -> OT_DONE|<session_id>|ok
 #
-# This is a DEMO FLOW ONLY.
-# It is NOT cryptographically secure OT yet.
-# It is the first step toward replacing manual chat with an OT-style protocol.
+# This is STILL a DEMO FLOW.
+# It is not cryptographically secure oblivious transfer.
+# It is a better protocol structure that hides the direct choice bit from the sender
+# and prepares the codebase for a real OT implementation later.
 
+import hashlib
+import secrets
 import socket
 import sys
 import threading
+from typing import Optional
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def xor_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+
+def xor_hex(hex_a: str, hex_b: str) -> str:
+    a = bytes.fromhex(hex_a)
+    b = bytes.fromhex(hex_b)
+    return xor_bytes(a, b).hex()
+
+
+def pad_message_to_32(message: str) -> bytes:
+    raw = message.encode("utf-8")
+    if len(raw) > 32:
+        raise ValueError("Message too long; keep demo messages at 32 bytes or fewer.")
+    return raw.ljust(32, b"\x00")
+
+
+def derive_pad(sender_nonce: str, mask_value: str) -> str:
+    return sha256_hex(f"{sender_nonce}|{mask_value}")
 
 
 class OTSenderState:
-    """Simple state container for the dummy OT sender."""
+    """State for sender-side OT demo."""
     def __init__(self):
-        self.session_id = "sess1"
-        self.m0 = "WIRE_LABEL_0"
-        self.m1 = "WIRE_LABEL_1"
-        self.phase = "WAIT_HELLO"
+        self.session_id: str = "sess1"
+        self.phase: str = "WAIT_HELLO"
+
+        # Demo payloads
+        self.m0: str = "WIRE_LABEL_0"
+        self.m1: str = "WIRE_LABEL_1"
+
+        # OT-related state
+        self.sender_nonce: Optional[str] = None
+        self.receiver_token: Optional[str] = None
+        self.mask0: Optional[str] = None
+        self.mask1: Optional[str] = None
+        self.enc0: Optional[str] = None
+        self.enc1: Optional[str] = None
 
 
 def send_all(sock: socket.socket, data: bytes) -> bool:
-    """Send all bytes, return False if the connection breaks."""
     try:
         sock.sendall(data)
         return True
@@ -33,28 +73,46 @@ def send_all(sock: socket.socket, data: bytes) -> bool:
         return False
 
 
-def send_message(conn: socket.socket, msg_type: str, *fields: str) -> bool:
-    """
-    Build a pipe-delimited protocol message and send it with exactly one newline.
-    Example:
-        HELLO_ACK|sess1|sender\n
-    """
-    line = "|".join([msg_type, *fields]) + "\n"
+def send_message(conn: socket.socket, msg_type: str, *fields: Optional[str]) -> bool:
+    parts = [msg_type] + [f if f is not None else "" for f in fields]
+    line = "|".join(parts) + "\n"
     print(f"[SEND] {line.rstrip()}")
     return send_all(conn, line.encode("utf-8"))
 
 
+def build_mask_pair(receiver_token: str):
+    """
+    Demo idea:
+    - sender receives one opaque receiver_token
+    - sender deterministically derives two masks from it
+    - receiver will only know how to reconstruct one of them later
+    """
+    mask0 = sha256_hex(receiver_token + "|0")
+    mask1 = sha256_hex(receiver_token + "|1")
+    return mask0, mask1
+
+
+def build_ciphertexts(state: OTSenderState):
+    if state.sender_nonce is None or state.mask0 is None or state.mask1 is None:
+        raise ValueError("Missing OT state for ciphertext construction.")
+
+    pad0 = derive_pad(state.sender_nonce, state.mask0)
+    pad1 = derive_pad(state.sender_nonce, state.mask1)
+
+    msg0_hex = pad_message_to_32(state.m0).hex()
+    msg1_hex = pad_message_to_32(state.m1).hex()
+
+    state.enc0 = xor_hex(msg0_hex, pad0)
+    state.enc1 = xor_hex(msg1_hex, pad1)
+
+
 def handle_message(conn: socket.socket, running: threading.Event, state: OTSenderState, text: str):
-    """
-    Parse one complete incoming message and react based on the current protocol phase.
-    """
     parts = text.split("|")
     msg_type = parts[0] if parts else ""
 
     print(f"[STATE] Current phase: {state.phase}")
 
     if msg_type == "HELLO":
-        # Expected format: HELLO|session_id|receiver
         if len(parts) != 3:
             print("[ERROR] Bad HELLO format. Expected: HELLO|<session_id>|receiver")
             running.clear()
@@ -81,21 +139,20 @@ def handle_message(conn: socket.socket, running: threading.Event, state: OTSende
             running.clear()
             return
 
-        state.phase = "WAIT_CHOICE"
+        state.phase = "WAIT_OT_INIT"
         print(f"[STATE] Transitioned to: {state.phase}")
 
-    elif msg_type == "OT_CHOICE":
-        # Expected format: OT_CHOICE|session_id|0_or_1
+    elif msg_type == "OT_INIT":
         if len(parts) != 3:
-            print("[ERROR] Bad OT_CHOICE format. Expected: OT_CHOICE|<session_id>|0_or_1")
+            print("[ERROR] Bad OT_INIT format. Expected: OT_INIT|<session_id>|<receiver_token>")
             running.clear()
             return
 
         session_id = parts[1]
-        choice = parts[2]
+        receiver_token = parts[2]
 
-        if state.phase != "WAIT_CHOICE":
-            print("[ERROR] Received OT_CHOICE in wrong phase.")
+        if state.phase != "WAIT_OT_INIT":
+            print("[ERROR] Received OT_INIT in wrong phase.")
             running.clear()
             return
 
@@ -104,27 +161,59 @@ def handle_message(conn: socket.socket, running: threading.Event, state: OTSende
             running.clear()
             return
 
-        if choice == "0":
-            selected = state.m0
-        elif choice == "1":
-            selected = state.m1
-        else:
-            print(f"[ERROR] Invalid choice bit '{choice}'. Expected 0 or 1.")
+        state.receiver_token = receiver_token
+        state.sender_nonce = secrets.token_hex(16)
+        state.mask0, state.mask1 = build_mask_pair(receiver_token)
+
+        try:
+            build_ciphertexts(state)
+        except ValueError as e:
+            print(f"[ERROR] {e}")
             running.clear()
             return
 
-        print(f"[INFO] Receiver chose bit {choice}")
-        print(f"[INFO] Sending selected message: {selected}")
+        print("[INFO] Built masked payloads for both branches.")
+        print("[INFO] Sender does not receive an explicit choice bit anymore.")
 
-        if not send_message(conn, "OT_RESULT", state.session_id, selected):
-            print("[ERROR] Failed to send OT_RESULT")
+        if not send_message(
+            conn,
+            "OT_MASKS",
+            state.session_id,
+            state.sender_nonce,
+            state.mask0,
+            state.mask1,
+            state.enc0,
+            state.enc1,
+        ):
+            print("[ERROR] Failed to send OT_MASKS")
             running.clear()
             return
 
-        state.phase = "DONE"
+        state.phase = "WAIT_DONE"
         print(f"[STATE] Transitioned to: {state.phase}")
 
-        # End demo after one OT exchange
+    elif msg_type == "OT_DONE":
+        if len(parts) != 3:
+            print("[ERROR] Bad OT_DONE format. Expected: OT_DONE|<session_id>|ok")
+            running.clear()
+            return
+
+        session_id = parts[1]
+        status = parts[2]
+
+        if state.phase != "WAIT_DONE":
+            print("[ERROR] Received OT_DONE in wrong phase.")
+            running.clear()
+            return
+
+        if session_id != state.session_id:
+            print(f"[ERROR] Session mismatch. Expected '{state.session_id}', got '{session_id}'")
+            running.clear()
+            return
+
+        print(f"[INFO] Receiver reported completion status: {status}")
+        state.phase = "DONE"
+        print(f"[STATE] Transitioned to: {state.phase}")
         running.clear()
 
     else:
@@ -133,10 +222,6 @@ def handle_message(conn: socket.socket, running: threading.Event, state: OTSende
 
 
 def receiver_loop(conn: socket.socket, running: threading.Event, state: OTSenderState):
-    """
-    Receive bytes, split complete newline-delimited messages, and pass them
-    to the OT protocol handler.
-    """
     buffer = b""
 
     try:
@@ -149,7 +234,6 @@ def receiver_loop(conn: socket.socket, running: threading.Event, state: OTSender
 
             buffer += chunk
 
-            # Process complete lines only
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
 
@@ -168,7 +252,8 @@ def receiver_loop(conn: socket.socket, running: threading.Event, state: OTSender
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("Usage: server.py <bind_ip> [port]")
+        print("Usage: serverOT.py <bind_ip> [port]")
+        print("Example: serverOT.py 0.0.0.0 12345")
         return 0
 
     bind_ip = sys.argv[1]
@@ -181,7 +266,6 @@ def main():
             print("Invalid port, using default 12345")
             port = 12345
 
-    # Create listening socket
     listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
